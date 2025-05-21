@@ -1,0 +1,14 @@
+version: '3.8'
+
+services:
+  spark:
+    image: bitnami/spark:latest
+    container_name: bronze_spark
+    environment:
+      SPARK_MODE=local
+      PYTHONPATH=/app/src
+  volumes:
+    ./src:/app/src
+    ./data:/app/data
+  working_dir: /app
+  command: /opt/bitnami/spark/bin/spark-submit /app/src/bronze_layer.py
