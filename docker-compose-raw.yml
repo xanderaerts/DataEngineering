@@ -14,4 +14,5 @@ services:
       - ./src:/app/src
       - ./data:/app/data
     working_dir: /app
-    command: /opt/bitnami/spark/bin/spark-submit /app/src/bronze_layer.py
+    command: bash -c "/opt/bitnami/spark/bin/spark-submit /app/src/bronze_layer.py && /opt/bitnami/spark/bin/spark-submit /app/src/Silver_Layer.py"
+
