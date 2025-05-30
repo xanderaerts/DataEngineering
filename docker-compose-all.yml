@@ -27,4 +27,4 @@ services:
           memory: 6g
         reservations:
           memory: 4g
-    command: /opt/bitnami/spark/bin/spark-submit /app/src/Gold_Layer.py
+    command: "bash -c /opt/bitnami/spark/bin/spark-submit /app/src/bronze_layer.py && /opt/bitnami/spark/bin/spark-submit /app/src/Silver_Layer.py && /opt/bitnami/spark/bin/spark-submit /app/src/Gold_Layer.py"
