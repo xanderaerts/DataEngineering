@@ -15,14 +15,11 @@ from pyspark.sql.types import StructType, StructField, StringType, IntegerType, 
 from pyspark.sql.window import Window
 import os
 import logging
-from datetime import datetime, date
-import matplotlib.pyplot as plt
-import pandas as pd
+from datetime import datetime, date, timedelta
 
 # --- Configuration ---
 silver_dir = 'data/Silver'
 gold_dir = 'data/Gold'
-plots_dir = 'plots'
 
 # Define path for the error log file
 error_log_dir = 'logs'
@@ -30,7 +27,6 @@ error_log_file_path = os.path.join(error_log_dir, 'gold_layer_errors.log')
 
 # Ensure directories exist
 os.makedirs(gold_dir, exist_ok=True)
-os.makedirs(plots_dir, exist_ok=True)
 os.makedirs(error_log_dir, exist_ok=True)
 
 # --- Logging Setup ---
@@ -65,38 +61,35 @@ except Exception as e:
 def generate_surrogate_key(df, columns):
     """Generate surrogate key based on multiple columns"""
     concat_cols = [coalesce(col(c).cast(StringType()), lit("NULL")) for c in columns]
-    return df.withColumn("surrogate_key", 
+    return df.withColumn("surrogate_key",
                          spark_abs(hash(concat(*concat_cols))))
 
+def safe_table_read(table_path, table_name):
+    """Safely read a table with error handling"""
+    try:
+        return spark.read.parquet(table_path)
+    except Exception as e:
+        logger.warning(f"Could not read {table_name} from {table_path}: {e}")
+        return None
 
 def create_date_dimension():
     """Create comprehensive date dimension table"""
     logger.info("Creating date dimension...")
-    
+
     # Create date range from 2010 to 2030
     start_date = date(2010, 1, 1)
     end_date = date(2030, 12, 31)
-    
+
     # Generate date range
     date_list = []
     current_date = start_date
     while current_date <= end_date:
         date_list.append((current_date,))
-        current_date = date(current_date.year + (1 if current_date.month == 12 else 0),
-                          (current_date.month % 12) + 1 if current_date.month != 12 else 1,
-                          1) if current_date.day == 1 else date(current_date.year, current_date.month, current_date.day + 1)
-    
-    # Create DataFrame with date range
-    from datetime import timedelta
-    date_list = []
-    current_date = start_date
-    while current_date <= end_date:
-        date_list.append((current_date,))
         current_date += timedelta(days=1)
-    
+
     schema = StructType([StructField("date", DateType(), True)])
     date_df = spark.createDataFrame(date_list, schema)
-    
+
     # Add date dimension attributes
     date_dim = date_df.select(
         col("date").alias("date_key"),
@@ -115,110 +108,60 @@ def create_date_dimension():
         current_timestamp().alias("created_date"),
         current_timestamp().alias("modified_date")
     )
-    
+
     return date_dim
 
-def implement_scd_type2(existing_df, new_df, business_keys, compare_columns):
-    """Implement SCD Type 2 for slowly changing dimensions"""
-    logger.info("Implementing SCD Type 2...")
-    
-    if existing_df is None:
-        # First load - add SCD columns
-        return new_df.withColumn("effective_start_date", current_timestamp()) \
-                    .withColumn("effective_end_date", lit(None).cast(TimestampType())) \
-                    .withColumn("is_current", lit(True)) \
-                    .withColumn("version", lit(1))
-    
-    # Join existing and new data on business keys
-    join_condition = [col(f"existing.{key}") == col(f"new.{key}") for key in business_keys]
-    joined_df = existing_df.alias("existing").join(new_df.alias("new"), 
-                                                  join_condition, "full_outer")
-    
-    # Identify changes
-    change_conditions = []
-    for col_name in compare_columns:
-        change_conditions.append(
-            col(f"existing.{col_name}") != col(f"new.{col_name}")
-        )
-    
-    # Create result DataFrame with SCD logic
-    # This is a simplified version - in production, you'd want more sophisticated logic
-    result_df = joined_df.select(
-        *[coalesce(col(f"new.{c}"), col(f"existing.{c}")).alias(c) for c in new_df.columns],
-        when(col("existing.is_current").isNull(), current_timestamp())
-        .otherwise(col("existing.effective_start_date")).alias("effective_start_date"),
-        lit(None).cast(TimestampType()).alias("effective_end_date"),
-        lit(True).alias("is_current"),
-        when(col("existing.version").isNull(), lit(1))
-        .otherwise(col("existing.version") + 1).alias("version")
-    )
-    
-    return result_df
-
-def upsert_to_gold(df, table_path, business_keys):
-    """Implement upsert functionality for Gold layer tables"""
-    logger.info(f"Upserting to Gold table: {table_path}")
-    
-    try:
-        # Check if table exists
-        if os.path.exists(table_path):
-            existing_df = spark.read.parquet(table_path)
-            
-            # Perform merge logic (simplified upsert)
-            # In production, you'd use Delta Lake for proper MERGE operations
-            join_condition = [col(f"existing.{key}") == col(f"new.{key}") for key in business_keys]
-            
-            # Get records that don't exist in target
-            new_records = df.alias("new").join(
-                existing_df.alias("existing").select(*business_keys), 
-                [col(f"new.{key}") == col(f"existing.{key}") for key in business_keys], 
-                "left_anti"
-            )
-            
-            # Union existing records with new records
-            result_df = existing_df.unionByName(new_records, allowMissingColumns=True)
-        else:
-            result_df = df
-        
-        # Write to Gold layer
-        result_df.write.mode("overwrite").parquet(table_path)
-        logger.info(f"Successfully upserted to {table_path}")
-        
-    except Exception as e:
-        logger.error(f"Error during upsert to {table_path}: {e}")
-        # Fallback to simple overwrite
-        df.write.mode("overwrite").parquet(table_path)
-
-# --- Gold Layer Dimension and Fact Table Creation ---
-
 def create_customer_dimension():
-    """Create customer dimension with SCD Type 2"""
+    """Create customer dimension with person info"""
     logger.info("Creating customer dimension...")
-    
+
     # Read Silver layer data
-    customer_df = spark.read.parquet(os.path.join(silver_dir, 'customer'))
-    person_df = spark.read.parquet(os.path.join(silver_dir, 'person'))
+    customer_df = safe_table_read(os.path.join(silver_dir, 'customer'), 'customer')
+    person_df = safe_table_read(os.path.join(silver_dir, 'person'), 'person')
     
-    # Join customer with person data
-    customer_dim = customer_df.join(
-        person_df, 
-        customer_df.PersonID == person_df.BusinessEntityID, 
-        "left"
-    ).select(
-        customer_df.CustomerID.alias("customer_key"),
-        customer_df.CustomerID.alias("customer_id"),
-        customer_df.AccountNumber.alias("account_number"),
-        person_df.FirstName.alias("first_name"),
-        person_df.MiddleName.alias("middle_name"),
-        person_df.LastName.alias("last_name"),
-        concat(coalesce(person_df.FirstName, lit("")), lit(" "), 
-               coalesce(person_df.LastName, lit(""))).alias("full_name"),
-        person_df.PersonType.alias("person_type"),
-        customer_df.TerritoryID.alias("territory_id"),
-        current_timestamp().alias("created_date"),
-        current_timestamp().alias("modified_date")
-    )
+    if customer_df is None:
+        logger.error("Customer table not found in Silver layer")
+        return None
     
+    if person_df is None:
+        logger.warning("Person table not found, creating customer dimension without person details")
+        customer_dim = customer_df.select(
+            col("CustomerID").alias("customer_key"),
+            col("CustomerID").alias("customer_id"),
+            col("AccountNumber").alias("account_number"),
+            lit("Unknown").alias("first_name"),
+            lit("Unknown").alias("middle_name"),
+            lit("Unknown").alias("last_name"),
+            lit("Unknown").alias("full_name"),
+            lit("Unknown").alias("person_type"),
+            col("TerritoryID").alias("territory_id"),
+            current_timestamp().alias("created_date"),
+            current_timestamp().alias("modified_date")
+        )
+    else:
+        # Join customer with person data
+        customer_dim = customer_df.join(
+            person_df,
+            customer_df.PersonID == person_df.BusinessEntityID,
+            "left"
+        ).select(
+            customer_df.CustomerID.alias("customer_key"),
+            customer_df.CustomerID.alias("customer_id"),
+            customer_df.AccountNumber.alias("account_number"),
+            coalesce(person_df.FirstName, lit("Unknown")).alias("first_name"),
+            coalesce(person_df.MiddleName, lit("")).alias("middle_name"),
+            coalesce(person_df.LastName, lit("Unknown")).alias("last_name"),
+            concat(
+                coalesce(person_df.FirstName, lit("Unknown")), 
+                lit(" "),
+                coalesce(person_df.LastName, lit("Unknown"))
+            ).alias("full_name"),
+            coalesce(person_df.PersonType, lit("Unknown")).alias("person_type"),
+            customer_df.TerritoryID.alias("territory_id"),
+            current_timestamp().alias("created_date"),
+            current_timestamp().alias("modified_date")
+        )
+
     # Add surrogate key
     customer_dim = generate_surrogate_key(customer_dim, ["customer_id"])
     
@@ -227,105 +170,109 @@ def create_customer_dimension():
 def create_product_dimension():
     """Create product dimension with category information"""
     logger.info("Creating product dimension...")
+
+    product_df = safe_table_read(os.path.join(silver_dir, 'product'), 'product')
     
-    product_df = spark.read.parquet(os.path.join(silver_dir, 'product'))
-    
-    # Read additional tables if they exist for product categories
-    try:
-        product_category_df = spark.read.parquet(os.path.join(silver_dir, 'productcategory'))
-        product_subcategory_df = spark.read.parquet(os.path.join(silver_dir, 'productsubcategory'))
-        
+    if product_df is None:
+        logger.error("Product table not found in Silver layer")
+        return None
+
+    # Try to read additional tables for product categories
+    product_category_df = safe_table_read(os.path.join(silver_dir, 'productcategory'), 'productcategory')
+    product_subcategory_df = safe_table_read(os.path.join(silver_dir, 'productsubcategory'), 'productsubcategory')
+
+    if product_category_df is not None and product_subcategory_df is not None:
         # Join product with category information
         product_dim = product_df.alias("p") \
-            .join(product_subcategory_df.alias("psc"), 
+            .join(product_subcategory_df.alias("psc"),
                   col("p.ProductSubcategoryID") == col("psc.ProductSubcategoryID"), "left") \
-            .join(product_category_df.alias("pc"), 
+            .join(product_category_df.alias("pc"),
                   col("psc.ProductCategoryID") == col("pc.ProductCategoryID"), "left")
-        
+
         product_dim = product_dim.select(
             col("p.ProductID").alias("product_key"),
             col("p.ProductID").alias("product_id"),
             col("p.Name").alias("product_name"),
             col("p.ProductNumber").alias("product_number"),
-            col("p.Color").alias("color"),
-            col("p.Size").alias("size"),
-            col("p.Weight").alias("weight"),
-            col("p.ListPrice").alias("list_price"),
-            col("p.StandardCost").alias("standard_cost"),
-            col("psc.Name").alias("subcategory_name"),
-            col("pc.Name").alias("category_name"),
+            coalesce(col("p.Color"), lit("Unknown")).alias("color"),
+            coalesce(col("p.Size"), lit("Unknown")).alias("size"),
+            coalesce(col("p.Weight"), lit(0.0)).alias("weight"),
+            coalesce(col("p.ListPrice"), lit(0.0)).alias("list_price"),
+            coalesce(col("p.StandardCost"), lit(0.0)).alias("standard_cost"),
+            coalesce(col("psc.Name"), lit("Unknown")).alias("subcategory_name"),
+            coalesce(col("pc.Name"), lit("Unknown")).alias("category_name"),
             current_timestamp().alias("created_date"),
             current_timestamp().alias("modified_date")
         )
-        
-    except Exception as e:
-        logger.warning(f"Could not find product category tables: {e}")
+    else:
         # Create dimension without category information
         product_dim = product_df.select(
             col("ProductID").alias("product_key"),
             col("ProductID").alias("product_id"),
             col("Name").alias("product_name"),
             col("ProductNumber").alias("product_number"),
-            col("Color").alias("color"),
-            col("Size").alias("size"),
-            col("Weight").alias("weight"),
-            col("ListPrice").alias("list_price"),
-            col("StandardCost").alias("standard_cost"),
+            coalesce(col("Color"), lit("Unknown")).alias("color"),
+            coalesce(col("Size"), lit("Unknown")).alias("size"),
+            coalesce(col("Weight"), lit(0.0)).alias("weight"),
+            coalesce(col("ListPrice"), lit(0.0)).alias("list_price"),
+            coalesce(col("StandardCost"), lit(0.0)).alias("standard_cost"),
             lit("Unknown").alias("subcategory_name"),
             lit("Unknown").alias("category_name"),
             current_timestamp().alias("created_date"),
             current_timestamp().alias("modified_date")
         )
-    
+
     # Add surrogate key
     product_dim = generate_surrogate_key(product_dim, ["product_id"])
-    
+
     return product_dim
 
 def create_geography_dimension():
     """Create geography dimension"""
     logger.info("Creating geography dimension...")
+
+    # Read address data
+    address_df = safe_table_read(os.path.join(silver_dir, 'address'), 'address')
     
-    # Read address and territory data
-    address_df = spark.read.parquet(os.path.join(silver_dir, 'address'))
-    
-    try:
-        # Try to read territory and country/state data if available
-        territory_df = spark.read.parquet(os.path.join(silver_dir, 'salesterritory'))
-        state_df = spark.read.parquet(os.path.join(silver_dir, 'stateprovince'))
-        country_df = spark.read.parquet(os.path.join(silver_dir, 'countryregion'))
-        
+    if address_df is None:
+        logger.error("Address table not found in Silver layer")
+        return None
+
+    # Try to read geography reference tables
+    territory_df = safe_table_read(os.path.join(silver_dir, 'salesterritory'), 'salesterritory')
+    state_df = safe_table_read(os.path.join(silver_dir, 'stateprovince'), 'stateprovince')
+    country_df = safe_table_read(os.path.join(silver_dir, 'countryregion'), 'countryregion')
+
+    if all([territory_df is not None, state_df is not None, country_df is not None]):
         geography_dim = address_df.alias("a") \
             .join(state_df.alias("s"), col("a.StateProvinceID") == col("s.StateProvinceID"), "left") \
             .join(country_df.alias("c"), col("s.CountryRegionCode") == col("c.CountryRegionCode"), "left") \
             .join(territory_df.alias("t"), col("s.TerritoryID") == col("t.TerritoryID"), "left")
-        
+
         geography_dim = geography_dim.select(
             col("a.AddressID").alias("geography_key"),
             col("a.AddressID").alias("address_id"),
-            col("a.AddressLine1").alias("address_line1"),
-            col("a.AddressLine2").alias("address_line2"),
-            col("a.City").alias("city"),
-            col("a.PostalCode").alias("postal_code"),
-            col("s.Name").alias("state_name"),
-            col("s.StateProvinceCode").alias("state_code"),
-            col("c.Name").alias("country_name"),
-            col("c.CountryRegionCode").alias("country_code"),
-            col("t.Name").alias("territory_name"),
+            coalesce(col("a.AddressLine1"), lit("Unknown")).alias("address_line1"),
+            coalesce(col("a.AddressLine2"), lit("")).alias("address_line2"),
+            coalesce(col("a.City"), lit("Unknown")).alias("city"),
+            coalesce(col("a.PostalCode"), lit("Unknown")).alias("postal_code"),
+            coalesce(col("s.Name"), lit("Unknown")).alias("state_name"),
+            coalesce(col("s.StateProvinceCode"), lit("UN")).alias("state_code"),
+            coalesce(col("c.Name"), lit("Unknown")).alias("country_name"),
+            coalesce(col("c.CountryRegionCode"), lit("UN")).alias("country_code"),
+            coalesce(col("t.Name"), lit("Unknown")).alias("territory_name"),
             current_timestamp().alias("created_date"),
             current_timestamp().alias("modified_date")
         )
-        
-    except Exception as e:
-        logger.warning(f"Could not find geography reference tables: {e}")
+    else:
         # Create simplified geography dimension
         geography_dim = address_df.select(
             col("AddressID").alias("geography_key"),
             col("AddressID").alias("address_id"),
-            col("AddressLine1").alias("address_line1"),
-            col("AddressLine2").alias("address_line2"),
-            col("City").alias("city"),
-            col("PostalCode").alias("postal_code"),
+            coalesce(col("AddressLine1"), lit("Unknown")).alias("address_line1"),
+            coalesce(col("AddressLine2"), lit("")).alias("address_line2"),
+            coalesce(col("City"), lit("Unknown")).alias("city"),
+            coalesce(col("PostalCode"), lit("Unknown")).alias("postal_code"),
             lit("Unknown").alias("state_name"),
             lit("UN").alias("state_code"),
             lit("Unknown").alias("country_name"),
@@ -334,286 +281,239 @@ def create_geography_dimension():
             current_timestamp().alias("created_date"),
             current_timestamp().alias("modified_date")
         )
-    
+
     # Add surrogate key
     geography_dim = generate_surrogate_key(geography_dim, ["address_id"])
-    
+
     return geography_dim
 
 def create_sales_fact_table():
     """Create main sales fact table"""
     logger.info("Creating sales fact table...")
-    
+
     # Read Silver layer data
-    order_header_df = spark.read.parquet(os.path.join(silver_dir, 'salesorderheader'))
-    order_detail_df = spark.read.parquet(os.path.join(silver_dir, 'salesorderdetail'))
-    
+    order_header_df = safe_table_read(os.path.join(silver_dir, 'salesorderheader'), 'salesorderheader')
+    order_detail_df = safe_table_read(os.path.join(silver_dir, 'salesorderdetail'), 'salesorderdetail')
+
+    if order_header_df is None or order_detail_df is None:
+        logger.error("Required sales tables not found in Silver layer")
+        return None
+
     # Join order header and detail
     sales_fact = order_detail_df.alias("od").join(
-        order_header_df.alias("oh"), 
+        order_header_df.alias("oh"),
         col("od.SalesOrderID") == col("oh.SalesOrderID")
     )
-    
+
     # Create fact table with measures and foreign keys
     sales_fact = sales_fact.select(
         # Surrogate key
         monotonically_increasing_id().alias("sales_fact_key"),
-        
+
         # Business keys
         col("oh.SalesOrderID").alias("sales_order_id"),
         col("od.SalesOrderDetailID").alias("sales_order_detail_id"),
-        
-        # Foreign keys (will be updated with dimension surrogate keys)
+
+        # Foreign keys
         col("oh.CustomerID").alias("customer_key"),
         col("od.ProductID").alias("product_key"),
-        col("oh.BillToAddressID").alias("bill_to_geography_key"),
-        col("oh.ShipToAddressID").alias("ship_to_geography_key"),
+        coalesce(col("oh.BillToAddressID"), col("oh.ShipToAddressID")).alias("bill_to_geography_key"),
+        coalesce(col("oh.ShipToAddressID"), col("oh.BillToAddressID")).alias("ship_to_geography_key"),
         col("oh.OrderDate").alias("order_date_key"),
-        col("oh.DueDate").alias("due_date_key"),
-        col("oh.ShipDate").alias("ship_date_key"),
-        
+        coalesce(col("oh.DueDate"), col("oh.OrderDate")).alias("due_date_key"),
+        coalesce(col("oh.ShipDate"), col("oh.OrderDate")).alias("ship_date_key"),
+
         # Measures
-        col("od.OrderQty").alias("order_quantity"),
-        col("od.UnitPrice").alias("unit_price"),
-        col("od.UnitPriceDiscount").alias("unit_price_discount"),
-        col("od.LineTotal").alias("line_total"),
-        col("oh.SubTotal").alias("order_subtotal"),
-        col("oh.TaxAmt").alias("tax_amount"),
-        col("oh.Freight").alias("freight"),
-        col("oh.TotalDue").alias("total_due"),
-        
+        coalesce(col("od.OrderQty"), lit(0)).alias("order_quantity"),
+        coalesce(col("od.UnitPrice"), lit(0.0)).alias("unit_price"),
+        coalesce(col("od.UnitPriceDiscount"), lit(0.0)).alias("unit_price_discount"),
+        coalesce(col("od.LineTotal"), lit(0.0)).alias("line_total"),
+        coalesce(col("oh.SubTotal"), lit(0.0)).alias("order_subtotal"),
+        coalesce(col("oh.TaxAmt"), lit(0.0)).alias("tax_amount"),
+        coalesce(col("oh.Freight"), lit(0.0)).alias("freight"),
+        coalesce(col("oh.TotalDue"), lit(0.0)).alias("total_due"),
+
+        # Calculated measures
+        (coalesce(col("od.OrderQty"), lit(0)) * coalesce(col("od.UnitPrice"), lit(0.0))).alias("gross_revenue"),
+        (coalesce(col("od.LineTotal"), lit(0.0))).alias("net_revenue"),
+
         # Attributes
-        col("oh.Status").alias("order_status"),
-        col("oh.OnlineOrderFlag").alias("online_order_flag"),
-        
+        coalesce(col("oh.Status"), lit(0)).alias("order_status"),
+        coalesce(col("oh.OnlineOrderFlag"), lit(False)).alias("online_order_flag"),
+
         # Audit columns
         current_timestamp().alias("created_date"),
         current_timestamp().alias("modified_date")
     )
-    
-    # Filter for current year (2014 based on typical AdventureWorks data)
-    current_year = 2014  # Adjust based on your data
-    sales_fact = sales_fact.filter(year("order_date_key") == current_year)
-    
+
     return sales_fact
 
-# --- Main Processing Logic ---
+def create_comprehensive_revenue_table():
+    """Create comprehensive table with all revenue analysis info merged"""
+    logger.info("Creating comprehensive revenue analysis table...")
+
+    # Read fact and dimension tables
+    sales_fact = spark.read.parquet(os.path.join(gold_dir, 'fact_sales'))
+    customer_dim = spark.read.parquet(os.path.join(gold_dir, 'dim_customer'))
+    product_dim = spark.read.parquet(os.path.join(gold_dir, 'dim_product'))
+    geography_dim = spark.read.parquet(os.path.join(gold_dir, 'dim_geography'))
+    date_dim = spark.read.parquet(os.path.join(gold_dir, 'dim_date'))
+
+    # Create comprehensive table with all dimensions joined
+    comprehensive_df = sales_fact.alias("sf") \
+        .join(customer_dim.alias("cd"), col("sf.customer_key") == col("cd.customer_key"), "left") \
+        .join(product_dim.alias("pd"), col("sf.product_key") == col("pd.product_key"), "left") \
+        .join(geography_dim.alias("gd"), col("sf.bill_to_geography_key") == col("gd.geography_key"), "left") \
+        .join(date_dim.alias("dd"), col("sf.order_date_key") == col("dd.date_key"), "left")
+
+    # Select all relevant columns for revenue analysis
+    revenue_analysis_table = comprehensive_df.select(
+        # Sales metrics
+        col("sf.sales_fact_key"),
+        col("sf.sales_order_id"),
+        col("sf.sales_order_detail_id"),
+        col("sf.order_quantity"),
+        col("sf.unit_price"),
+        col("sf.unit_price_discount"),
+        col("sf.line_total"),
+        col("sf.net_revenue"),
+        col("sf.gross_revenue"),
+        col("sf.order_subtotal"),
+        col("sf.tax_amount"),
+        col("sf.freight"),
+        col("sf.total_due"),
+        col("sf.order_status"),
+        
+        # Order status description
+        when(col("sf.order_status") == 1, "In Process")
+        .when(col("sf.order_status") == 2, "Approved")
+        .when(col("sf.order_status") == 3, "Backordered")
+        .when(col("sf.order_status") == 4, "Rejected")
+        .when(col("sf.order_status") == 5, "Shipped")
+        .when(col("sf.order_status") == 6, "Cancelled")
+        .otherwise("Unknown").alias("order_status_desc"),
+        
+        col("sf.online_order_flag"),
+
+        # Customer information
+        col("cd.customer_id"),
+        col("cd.account_number"),
+        col("cd.first_name"),
+        col("cd.middle_name"),
+        col("cd.last_name"),
+        col("cd.full_name"),
+        col("cd.person_type"),
+
+        # Product information
+        col("pd.product_id"),
+        col("pd.product_name"),
+        col("pd.product_number"),
+        col("pd.color"),
+        col("pd.size"),
+        col("pd.weight"),
+        col("pd.list_price"),
+        col("pd.standard_cost"),
+        col("pd.subcategory_name"),
+        col("pd.category_name"),
+
+        # Geography information
+        col("gd.address_id"),
+        col("gd.address_line1"),
+        col("gd.address_line2"),
+        col("gd.city"),
+        col("gd.postal_code"),
+        col("gd.state_name"),
+        col("gd.state_code"),
+        col("gd.country_name"),
+        col("gd.country_code"),
+        col("gd.territory_name"),
+
+        # Date information
+        col("sf.order_date_key").alias("order_date"),
+        col("dd.year").alias("order_year"),
+        col("dd.month").alias("order_month"),
+        col("dd.quarter").alias("order_quarter"),
+        col("dd.month_name"),
+        col("dd.day_name"),
+        col("dd.year_month"),
+        col("dd.year_quarter"),
+
+        # Calculated fields for analysis
+        (col("sf.net_revenue") * col("sf.order_quantity")).alias("total_line_revenue"),
+        (col("pd.list_price") - col("pd.standard_cost")).alias("profit_margin"),
+        current_timestamp().alias("created_date")
+    )
+
+    return revenue_analysis_table
+
+def write_table_with_logging(df, table_path, table_name):
+    """Write table with logging and error handling"""
+    try:
+        if df is not None:
+            record_count = df.count()
+            df.write.mode("overwrite").parquet(table_path)
+            logger.info(f"{table_name} created successfully with {record_count} records")
+        else:
+            logger.error(f"Failed to create {table_name} - DataFrame is None")
+    except Exception as e:
+        logger.error(f"Error writing {table_name}: {e}")
 
 def main():
     """Main processing function"""
     logger.info("Starting Gold layer processing...")
-    
-    # Create Date Dimension
-    date_dim = create_date_dimension()
-    upsert_to_gold(date_dim, os.path.join(gold_dir, 'dim_date'), ["date_key"])
-    logger.info(f"Date dimension created with {date_dim.count()} records")
-    
-    # Create Customer Dimension
-    customer_dim = create_customer_dimension()
-    upsert_to_gold(customer_dim, os.path.join(gold_dir, 'dim_customer'), ["customer_id"])
-    logger.info(f"Customer dimension created with {customer_dim.count()} records")
-    
-    # Create Product Dimension
-    product_dim = create_product_dimension()
-    upsert_to_gold(product_dim, os.path.join(gold_dir, 'dim_product'), ["product_id"])
-    logger.info(f"Product dimension created with {product_dim.count()} records")
-    
-    # Create Geography Dimension
-    geography_dim = create_geography_dimension()
-    upsert_to_gold(geography_dim, os.path.join(gold_dir, 'dim_geography'), ["address_id"])
-    logger.info(f"Geography dimension created with {geography_dim.count()} records")
-    
-    # Create Sales Fact Table
-    sales_fact = create_sales_fact_table()
-    upsert_to_gold(sales_fact, os.path.join(gold_dir, 'fact_sales'), ["sales_order_id", "sales_order_detail_id"])
-    logger.info(f"Sales fact table created with {sales_fact.count()} records")
-    
-    # Generate required plots
-    generate_plots(sales_fact, product_dim, customer_dim, geography_dim)
-    
-    logger.info("Gold layer processing completed successfully!")
 
-def generate_plots(sales_fact, product_dim, customer_dim, geography_dim):
-    """Generate all required plots for the assignment"""
-    logger.info("Generating plots...")
-    
-    # 1. Revenue by Category (all)
     try:
-        category_revenue = sales_fact.join(product_dim, "product_key") \
-            .groupBy("category_name") \
-            .agg(spark_sum("line_total").alias("revenue")) \
-            .orderBy(desc("revenue"))
-        
-        category_revenue_pd = category_revenue.toPandas()
-        
-        plt.figure(figsize=(12, 8))
-        plt.bar(category_revenue_pd['category_name'], category_revenue_pd['revenue'])
-        plt.title('Revenue by Category')
-        plt.xlabel('Category')
-        plt.ylabel('Revenue')
-        plt.xticks(rotation=45)
-        plt.tight_layout()
-        plt.savefig(os.path.join(plots_dir, 'revenue_by_category.png'))
-        plt.close()
-        
-        logger.info("Generated: Revenue by Category plot")
+        # Create Date Dimension
+        date_dim = create_date_dimension()
+        write_table_with_logging(date_dim, os.path.join(gold_dir, 'dim_date'), 'Date Dimension')
+
+        # Create Customer Dimension
+        customer_dim = create_customer_dimension()
+        write_table_with_logging(customer_dim, os.path.join(gold_dir, 'dim_customer'), 'Customer Dimension')
+
+        # Create Product Dimension
+        product_dim = create_product_dimension()
+        write_table_with_logging(product_dim, os.path.join(gold_dir, 'dim_product'), 'Product Dimension')
+
+        # Create Geography Dimension
+        geography_dim = create_geography_dimension()
+        write_table_with_logging(geography_dim, os.path.join(gold_dir, 'dim_geography'), 'Geography Dimension')
+
+        # Create Sales Fact Table
+        sales_fact = create_sales_fact_table()
+        write_table_with_logging(sales_fact, os.path.join(gold_dir, 'fact_sales'), 'Sales Fact Table')
+
+        # Create Comprehensive Revenue Analysis Table
+        if all(os.path.exists(os.path.join(gold_dir, table)) for table in ['fact_sales', 'dim_customer', 'dim_product', 'dim_geography', 'dim_date']):
+            revenue_analysis_table = create_comprehensive_revenue_table()
+            write_table_with_logging(revenue_analysis_table, os.path.join(gold_dir, 'revenue_analysis_comprehensive'), 'Comprehensive Revenue Analysis Table')
+        else:
+            logger.warning("Not all required tables exist, skipping comprehensive revenue table creation")
+
+        logger.info("Gold layer processing completed successfully!")
+
+        # Display summary statistics
+        logger.info("=== GOLD LAYER SUMMARY ===")
+        gold_tables = [d for d in os.listdir(gold_dir) if os.path.isdir(os.path.join(gold_dir, d))]
+        for table in gold_tables:
+            try:
+                df = spark.read.parquet(os.path.join(gold_dir, table))
+                logger.info(f"{table}: {df.count()} records, {len(df.columns)} columns")
+            except Exception as e:
+                logger.error(f"Error reading {table}: {e}")
+
     except Exception as e:
-        logger.error(f"Error generating category revenue plot: {e}")
-    
-    # 2. Top-10 Subcategories
-    try:
-        subcategory_revenue = sales_fact.join(product_dim, "product_key") \
-            .groupBy("subcategory_name") \
-            .agg(spark_sum("line_total").alias("revenue")) \
-            .orderBy(desc("revenue")) \
-            .limit(10)
-        
-        subcategory_revenue_pd = subcategory_revenue.toPandas()
-        
-        plt.figure(figsize=(12, 8))
-        plt.bar(subcategory_revenue_pd['subcategory_name'], subcategory_revenue_pd['revenue'])
-        plt.title('Top 10 Subcategories by Revenue')
-        plt.xlabel('Subcategory')
-        plt.ylabel('Revenue')
-        plt.xticks(rotation=45)
-        plt.tight_layout()
-        plt.savefig(os.path.join(plots_dir, 'top10_subcategories.png'))
-        plt.close()
-        
-        logger.info("Generated: Top 10 Subcategories plot")
-    except Exception as e:
-        logger.error(f"Error generating subcategory revenue plot: {e}")
-    
-    # 3. Top-10 Customers
-    try:
-        customer_revenue = sales_fact.join(customer_dim, "customer_key") \
-            .groupBy("customer_id", "full_name") \
-            .agg(spark_sum("line_total").alias("revenue")) \
-            .orderBy(desc("revenue")) \
-            .limit(10)
-        
-        customer_revenue_pd = customer_revenue.toPandas()
-        
-        plt.figure(figsize=(12, 8))
-        plt.bar(range(len(customer_revenue_pd)), customer_revenue_pd['revenue'])
-        plt.title('Top 10 Customers by Revenue')
-        plt.xlabel('Customer Rank')
-        plt.ylabel('Revenue')
-        plt.xticks(range(len(customer_revenue_pd)), [f"Customer {i+1}" for i in range(len(customer_revenue_pd))])
-        plt.tight_layout()
-        plt.savefig(os.path.join(plots_dir, 'top10_customers.png'))
-        plt.close()
-        
-        logger.info("Generated: Top 10 Customers plot")
-    except Exception as e:
-        logger.error(f"Error generating customer revenue plot: {e}")
-    
-    # 4. Revenue by Order Status (all)
-    try:
-        status_revenue = sales_fact.groupBy("order_status") \
-            .agg(spark_sum("line_total").alias("revenue")) \
-            .orderBy(desc("revenue"))
-        
-        status_revenue_pd = status_revenue.toPandas()
-        
-        plt.figure(figsize=(10, 6))
-        plt.pie(status_revenue_pd['revenue'], labels=status_revenue_pd['order_status'], autopct='%1.1f%%')
-        plt.title('Revenue by Order Status')
-        plt.savefig(os.path.join(plots_dir, 'revenue_by_order_status.png'))
-        plt.close()
-        
-        logger.info("Generated: Revenue by Order Status plot")
-    except Exception as e:
-        logger.error(f"Error generating order status revenue plot: {e}")
-    
-    # 5. Top-10 Countries revenue
-    try:
-        country_revenue = sales_fact.join(geography_dim, 
-                                        sales_fact.bill_to_geography_key == geography_dim.geography_key) \
-            .groupBy("country_name") \
-            .agg(spark_sum("line_total").alias("revenue")) \
-            .orderBy(desc("revenue")) \
-            .limit(10)
-        
-        country_revenue_pd = country_revenue.toPandas()
-        
-        plt.figure(figsize=(12, 8))
-        plt.bar(country_revenue_pd['country_name'], country_revenue_pd['revenue'])
-        plt.title('Top 10 Countries by Revenue')
-        plt.xlabel('Country')
-        plt.ylabel('Revenue')
-        plt.xticks(rotation=45)
-        plt.tight_layout()
-        plt.savefig(os.path.join(plots_dir, 'top10_countries.png'))
-        plt.close()
-        
-        logger.info("Generated: Top 10 Countries plot")
-    except Exception as e:
-        logger.error(f"Error generating country revenue plot: {e}")
-    
-    # 6. Top-10 States revenue
-    try:
-        state_revenue = sales_fact.join(geography_dim, 
-                                      sales_fact.bill_to_geography_key == geography_dim.geography_key) \
-            .groupBy("state_name") \
-            .agg(spark_sum("line_total").alias("revenue")) \
-            .orderBy(desc("revenue")) \
-            .limit(10)
-        
-        state_revenue_pd = state_revenue.toPandas()
-        
-        plt.figure(figsize=(12, 8))
-        plt.bar(state_revenue_pd['state_name'], state_revenue_pd['revenue'])
-        plt.title('Top 10 States by Revenue')
-        plt.xlabel('State')
-        plt.ylabel('Revenue')
-        plt.xticks(rotation=45)
-        plt.tight_layout()
-        plt.savefig(os.path.join(plots_dir, 'top10_states.png'))
-        plt.close()
-        
-        logger.info("Generated: Top 10 States plot")
-    except Exception as e:
-        logger.error(f"Error generating state revenue plot: {e}")
-    
-    # 7. Top-10 Cities revenue
-    try:
-        city_revenue = sales_fact.join(geography_dim, 
-                                     sales_fact.bill_to_geography_key == geography_dim.geography_key) \
-            .groupBy("city") \
-            .agg(spark_sum("line_total").alias("revenue")) \
-            .orderBy(desc("revenue")) \
-            .limit(10)
-        
-        city_revenue_pd = city_revenue.toPandas()
-        
-        plt.figure(figsize=(12, 8))
-        plt.bar(city_revenue_pd['city'], city_revenue_pd['revenue'])
-        plt.title('Top 10 Cities by Revenue')
-        plt.xlabel('City')
-        plt.ylabel('Revenue')
-        plt.xticks(rotation=45)
-        plt.tight_layout()
-        plt.savefig(os.path.join(plots_dir, 'top10_cities.png'))
-        plt.close()
-        
-        logger.info("Generated: Top 10 Cities plot")
-    except Exception as e:
-        logger.error(f"Error generating city revenue plot: {e}")
+        logger.error(f"Error in main processing: {e}")
+        raise
 
 if __name__ == "__main__":
     try:
         main()
     except Exception as e:
         logger.error("🔥 Unhandled exception occurred in main()", exc_info=True)
-        # Optional: print traceback to console too
         import traceback
         traceback.print_exc()
-        # Exit with error code so you still know something broke
         exit(1)
     finally:
-        # Make sure Spark gets stopped no matter what
         spark.stop()
         logger.info("SparkSession stopped.")
-
-

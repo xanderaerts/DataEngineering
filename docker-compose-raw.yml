@@ -27,4 +27,4 @@ services:
           memory: 6g
         reservations:
           memory: 4g
-    command: /opt/bitnami/spark/bin/spark-submit /app/src/Gold_Layer.py
+    command: /opt/bitnami/spark/bin/spark-submit /app/src/Plots.py
