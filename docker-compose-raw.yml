@@ -10,9 +10,21 @@ services:
     environment:
       SPARK_MODE: local
       PYTHONPATH: /app/src
+      _JAVA_OPTIONS: "-XX:+UnlockExperimentalVMOptions -XX:+UseContainerSupport -XX:MaxRAMPercentage=80.0"
+      SPARK_DRIVER_MEMORY: 4g
+      SPARK_EXECUTOR_MEMORY: 4g
+      # Optional: If matplotlib yells at you
+      # MPLCONFIGDIR: /tmp/matplotlib_config
     volumes:
       - ./src:/app/src
       - ./data:/app/data
+      - ./plots:/app/plots
+      - ./logs:/app/logs
     working_dir: /app
-    command: bash -c "/opt/bitnami/spark/bin/spark-submit /app/src/bronze_layer.py && /opt/bitnami/spark/bin/spark-submit /app/src/Silver_Layer.py"
-
+    deploy:
+      resources:
+        limits:
+          memory: 6g
+        reservations:
+          memory: 4g
+    command: /opt/bitnami/spark/bin/spark-submit /app/src/Gold_Layer.py
