@@ -14,7 +14,7 @@ services:
       SPARK_DRIVER_MEMORY: 4g
       SPARK_EXECUTOR_MEMORY: 4g
       # Optional: If matplotlib yells at you
-      # MPLCONFIGDIR: /tmp/matplotlib_config
+      #MPLCONFIGDIR: /tmp/matplotlib_config
     volumes:
       - ./src:/app/src
       - ./data:/app/data
