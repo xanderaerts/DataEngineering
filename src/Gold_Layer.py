@@ -44,7 +44,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-logger.info("Starting PySpark Data Layer Processing (Gold Layer)...")
+logger.info("Starting PySpark Data Layer Processing (Gold Layer with SCD and Upsert)...")
 
 # --- Spark Session Initialization ---
 try:
@@ -71,6 +71,146 @@ def safe_table_read(table_path, table_name):
     except Exception as e:
         logger.warning(f"Could not read {table_name} from {table_path}: {e}")
         return None
+
+def add_scd_columns(df):
+    """Add SCD Type 2 columns to dimension tables"""
+    return df.withColumn("effective_date", current_timestamp()) \
+             .withColumn("end_date", lit(None).cast(TimestampType())) \
+             .withColumn("is_current", lit(True)) \
+             .withColumn("version", lit(1))
+
+def upsert_dimension_table(new_data, table_path, table_name, business_key_columns):
+    """
+    Perform SCD Type 2 upsert on dimension table
+    """
+    logger.info(f"Performing SCD Type 2 upsert for {table_name}...")
+    
+    # Check if table exists
+    if os.path.exists(table_path):
+        try:
+            existing_data = spark.read.parquet(table_path)
+            logger.info(f"Found existing {table_name} with {existing_data.count()} records")
+            
+            # Get current records (is_current = True)
+            current_records = existing_data.filter(col("is_current") == True)
+            
+            # Create a comparison key for detecting changes
+            comparison_cols = [c for c in new_data.columns if c not in ['created_date', 'modified_date', 'effective_date', 'end_date', 'is_current', 'version', 'surrogate_key']]
+            
+            # Join to find changes
+            joined_df = new_data.alias("new").join(
+                current_records.alias("existing"),
+                [col(f"new.{bk}") == col(f"existing.{bk}") for bk in business_key_columns],
+                "left"
+            )
+            
+            # Identify new records (no match in existing)
+            new_records = joined_df.filter(col("existing.surrogate_key").isNull()) \
+                                   .select("new.*")
+            
+            # Identify changed records
+            changed_records = joined_df.filter(col("existing.surrogate_key").isNotNull())
+            
+            # Check for actual changes in data
+            change_conditions = []
+            for col_name in comparison_cols:
+                if col_name in business_key_columns:
+                    continue
+                change_conditions.append(
+                    coalesce(col(f"new.{col_name}"), lit("NULL")) != 
+                    coalesce(col(f"existing.{col_name}"), lit("NULL"))
+                )
+            
+            if change_conditions:
+                changed_filter = change_conditions[0]
+                for condition in change_conditions[1:]:
+                    changed_filter = changed_filter | condition
+                
+                actually_changed = changed_records.filter(changed_filter)
+                unchanged = changed_records.filter(~changed_filter)
+            else:
+                actually_changed = spark.createDataFrame([], new_data.schema)
+                unchanged = changed_records
+            
+            # Handle unchanged records - keep existing
+            unchanged_existing = unchanged.select("existing.*")
+            
+            # Handle new records - add with SCD columns
+            final_new_records = add_scd_columns(new_records)
+            
+            # Handle changed records
+            if actually_changed.count() > 0:
+                # Close existing records
+                closed_records = actually_changed.select("existing.*") \
+                    .withColumn("end_date", current_timestamp()) \
+                    .withColumn("is_current", lit(False))
+                
+                # Create new versions of changed records
+                new_versions = actually_changed.select("new.*") \
+                    .join(actually_changed.select("existing.version", *[f"existing.{bk}" for bk in business_key_columns]),
+                          [col(f"new.{bk}") == col(f"existing.{bk}") for bk in business_key_columns]) \
+                    .withColumn("effective_date", current_timestamp()) \
+                    .withColumn("end_date", lit(None).cast(TimestampType())) \
+                    .withColumn("is_current", lit(True)) \
+                    .withColumn("version", col("existing.version") + 1) \
+                    .drop(*[f"existing.{bk}" for bk in business_key_columns]) \
+                    .drop("existing.version")
+                
+                # Combine all records
+                historical_records = existing_data.filter(col("is_current") == False)
+                result_df = historical_records.union(unchanged_existing) \
+                                             .union(closed_records) \
+                                             .union(final_new_records) \
+                                             .union(new_versions)
+            else:
+                # No changes, just add new records
+                historical_records = existing_data.filter(col("is_current") == False)
+                result_df = historical_records.union(unchanged_existing) \
+                                             .union(final_new_records)
+                
+            logger.info(f"SCD upsert completed: {result_df.count()} total records")
+            return result_df
+            
+        except Exception as e:
+            logger.error(f"Error during SCD upsert for {table_name}: {e}")
+            # Fall back to initial load
+            return add_scd_columns(new_data)
+    else:
+        # Initial load - add SCD columns
+        logger.info(f"Initial load for {table_name}")
+        return add_scd_columns(new_data)
+
+def upsert_fact_table(new_data, table_path, table_name, business_key_columns):
+    """
+    Perform upsert on fact table (Type 1 - overwrite existing records)
+    """
+    logger.info(f"Performing fact table upsert for {table_name}...")
+    
+    if os.path.exists(table_path):
+        try:
+            existing_data = spark.read.parquet(table_path)
+            logger.info(f"Found existing {table_name} with {existing_data.count()} records")
+            
+            # For fact tables, we typically do a merge (upsert)
+            # Remove existing records that match business keys
+            existing_to_keep = existing_data.alias("existing").join(
+                new_data.alias("new"),
+                [col(f"existing.{bk}") == col(f"new.{bk}") for bk in business_key_columns],
+                "left_anti"
+            )
+            
+            # Combine with new data
+            result_df = existing_to_keep.union(new_data)
+            
+            logger.info(f"Fact upsert completed: {result_df.count()} total records")
+            return result_df
+            
+        except Exception as e:
+            logger.error(f"Error during fact upsert for {table_name}: {e}")
+            return new_data
+    else:
+        logger.info(f"Initial load for fact table {table_name}")
+        return new_data
 
 def create_date_dimension():
     """Create comprehensive date dimension table"""
@@ -352,12 +492,42 @@ def create_comprehensive_revenue_table():
     """Create comprehensive table with all revenue analysis info merged"""
     logger.info("Creating comprehensive revenue analysis table...")
 
-    # Read fact and dimension tables
-    sales_fact = spark.read.parquet(os.path.join(gold_dir, 'fact_sales'))
-    customer_dim = spark.read.parquet(os.path.join(gold_dir, 'dim_customer'))
-    product_dim = spark.read.parquet(os.path.join(gold_dir, 'dim_product'))
-    geography_dim = spark.read.parquet(os.path.join(gold_dir, 'dim_geography'))
-    date_dim = spark.read.parquet(os.path.join(gold_dir, 'dim_date'))
+    # Check if all required tables exist
+    required_tables = ['fact_sales', 'dim_customer', 'dim_product', 'dim_geography', 'dim_date']
+    missing_tables = []
+    
+    for table in required_tables:
+        table_path = os.path.join(gold_dir, table)
+        if not os.path.exists(table_path):
+            missing_tables.append(table)
+            logger.error(f"Required table {table} not found at {table_path}")
+    
+    if missing_tables:
+        logger.error(f"Cannot create comprehensive revenue table. Missing tables: {missing_tables}")
+        return None
+
+    try:
+        # Read fact and dimension tables - get current records only for dimensions
+        sales_fact = spark.read.parquet(os.path.join(gold_dir, 'fact_sales'))
+        logger.info(f"Successfully read sales fact table with {sales_fact.count()} records")
+        
+        # For SCD tables, only get current records for the comprehensive view
+        # Date dimension doesn't have SCD columns, so read it directly
+        customer_dim = spark.read.parquet(os.path.join(gold_dir, 'dim_customer')).filter(col("is_current") == True)
+        logger.info(f"Successfully read customer dimension with {customer_dim.count()} current records")
+        
+        product_dim = spark.read.parquet(os.path.join(gold_dir, 'dim_product')).filter(col("is_current") == True)
+        logger.info(f"Successfully read product dimension with {product_dim.count()} current records")
+        
+        geography_dim = spark.read.parquet(os.path.join(gold_dir, 'dim_geography')).filter(col("is_current") == True)
+        logger.info(f"Successfully read geography dimension with {geography_dim.count()} current records")
+        
+        date_dim = spark.read.parquet(os.path.join(gold_dir, 'dim_date'))  # No SCD filter for date dimension
+        logger.info(f"Successfully read date dimension with {date_dim.count()} records")
+        
+    except Exception as e:
+        logger.error(f"Error reading dimension tables: {e}")
+        return None
 
     # Create comprehensive table with all dimensions joined
     comprehensive_df = sales_fact.alias("sf") \
@@ -446,51 +616,92 @@ def create_comprehensive_revenue_table():
 
     return revenue_analysis_table
 
-def write_table_with_logging(df, table_path, table_name):
-    """Write table with logging and error handling"""
+def write_table_with_logging(df, table_path, table_name, is_dimension=False, business_keys=None):
+    """Write table with logging, error handling, and upsert support"""
     try:
         if df is not None:
-            record_count = df.count()
-            df.write.mode("overwrite").parquet(table_path)
-            logger.info(f"{table_name} created successfully with {record_count} records")
+            if is_dimension and business_keys:
+                # Use SCD Type 2 upsert for dimensions
+                final_df = upsert_dimension_table(df, table_path, table_name, business_keys)
+            elif not is_dimension and business_keys:
+                # Use Type 1 upsert for facts
+                final_df = upsert_fact_table(df, table_path, table_name, business_keys)
+            else:
+                # Default to overwrite for tables without business keys
+                final_df = df
+            
+            record_count = final_df.count()
+            final_df.write.mode("overwrite").parquet(table_path)
+            logger.info(f"{table_name} written successfully with {record_count} records")
         else:
-            logger.error(f"Failed to create {table_name} - DataFrame is None")
+            logger.error(f"Failed to write {table_name} - DataFrame is None")
     except Exception as e:
         logger.error(f"Error writing {table_name}: {e}")
 
 def main():
-    """Main processing function"""
-    logger.info("Starting Gold layer processing...")
+    """Main processing function with SCD and upsert capabilities"""
+    logger.info("Starting Gold layer processing with SCD and upsert...")
 
     try:
-        # Create Date Dimension
+        # Create Date Dimension (no SCD needed for date dimension typically)
+        logger.info("Creating Date Dimension...")
         date_dim = create_date_dimension()
         write_table_with_logging(date_dim, os.path.join(gold_dir, 'dim_date'), 'Date Dimension')
 
-        # Create Customer Dimension
+        # Create Customer Dimension with SCD Type 2
+        logger.info("Creating Customer Dimension...")
         customer_dim = create_customer_dimension()
-        write_table_with_logging(customer_dim, os.path.join(gold_dir, 'dim_customer'), 'Customer Dimension')
+        if customer_dim is not None:
+            write_table_with_logging(customer_dim, os.path.join(gold_dir, 'dim_customer'), 'Customer Dimension', 
+                                   is_dimension=True, business_keys=['customer_id'])
+        else:
+            logger.error("Failed to create Customer Dimension")
 
-        # Create Product Dimension
+        # Create Product Dimension with SCD Type 2
+        logger.info("Creating Product Dimension...")
         product_dim = create_product_dimension()
-        write_table_with_logging(product_dim, os.path.join(gold_dir, 'dim_product'), 'Product Dimension')
+        if product_dim is not None:
+            write_table_with_logging(product_dim, os.path.join(gold_dir, 'dim_product'), 'Product Dimension',
+                                   is_dimension=True, business_keys=['product_id'])
+        else:
+            logger.error("Failed to create Product Dimension")
 
-        # Create Geography Dimension
+        # Create Geography Dimension with SCD Type 2
+        logger.info("Creating Geography Dimension...")
         geography_dim = create_geography_dimension()
-        write_table_with_logging(geography_dim, os.path.join(gold_dir, 'dim_geography'), 'Geography Dimension')
+        if geography_dim is not None:
+            write_table_with_logging(geography_dim, os.path.join(gold_dir, 'dim_geography'), 'Geography Dimension',
+                                   is_dimension=True, business_keys=['address_id'])
+        else:
+            logger.error("Failed to create Geography Dimension")
 
-        # Create Sales Fact Table
+        # Create Sales Fact Table with upsert
+        logger.info("Creating Sales Fact Table...")
         sales_fact = create_sales_fact_table()
-        write_table_with_logging(sales_fact, os.path.join(gold_dir, 'fact_sales'), 'Sales Fact Table')
+        if sales_fact is not None:
+            write_table_with_logging(sales_fact, os.path.join(gold_dir, 'fact_sales'), 'Sales Fact Table',
+                                   is_dimension=False, business_keys=['sales_order_id', 'sales_order_detail_id'])
+        else:
+            logger.error("Failed to create Sales Fact Table")
 
         # Create Comprehensive Revenue Analysis Table
-        if all(os.path.exists(os.path.join(gold_dir, table)) for table in ['fact_sales', 'dim_customer', 'dim_product', 'dim_geography', 'dim_date']):
+        logger.info("Checking if all tables exist for comprehensive revenue analysis...")
+        required_tables = ['fact_sales', 'dim_customer', 'dim_product', 'dim_geography', 'dim_date']
+        tables_exist = all(os.path.exists(os.path.join(gold_dir, table)) for table in required_tables)
+        
+        if tables_exist:
+            logger.info("All required tables exist, creating comprehensive revenue analysis table...")
             revenue_analysis_table = create_comprehensive_revenue_table()
-            write_table_with_logging(revenue_analysis_table, os.path.join(gold_dir, 'revenue_analysis_comprehensive'), 'Comprehensive Revenue Analysis Table')
+            if revenue_analysis_table is not None:
+                write_table_with_logging(revenue_analysis_table, os.path.join(gold_dir, 'revenue_analysis_comprehensive'), 
+                                       'Comprehensive Revenue Analysis Table')
+            else:
+                logger.warning("Failed to create comprehensive revenue analysis table")
         else:
-            logger.warning("Not all required tables exist, skipping comprehensive revenue table creation")
+            missing_tables = [table for table in required_tables if not os.path.exists(os.path.join(gold_dir, table))]
+            logger.warning(f"Not all required tables exist, skipping comprehensive revenue table creation. Missing: {missing_tables}")
 
-        logger.info("Gold layer processing completed successfully!")
+        logger.info("Gold layer processing with SCD and upsert completed successfully!")
 
         # Display summary statistics
         logger.info("=== GOLD LAYER SUMMARY ===")
@@ -498,7 +709,15 @@ def main():
         for table in gold_tables:
             try:
                 df = spark.read.parquet(os.path.join(gold_dir, table))
-                logger.info(f"{table}: {df.count()} records, {len(df.columns)} columns")
+                
+                # Show SCD info for dimension tables
+                if table.startswith('dim_') and 'is_current' in df.columns:
+                    current_count = df.filter(col("is_current") == True).count()
+                    total_count = df.count()
+                    logger.info(f"{table}: {total_count} total records ({current_count} current, {total_count - current_count} historical), {len(df.columns)} columns")
+                else:
+                    logger.info(f"{table}: {df.count()} records, {len(df.columns)} columns")
+                    
             except Exception as e:
                 logger.error(f"Error reading {table}: {e}")
 
